@@ -1,69 +1,82 @@
-# makefun-github-core-clone
+# github-core-clone-01 v2
 
 [![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![rank](https://make.fun/badge/github-core-clone-01/local-deviant/makefun-github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![reward](https://make.fun/badge/github-core-clone-01/local-deviant/makefun-github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-A GitHub-compatible git forge in a single Node 22 process, standard library
-only. Built from scratch for make.fun's **github-core-clone-01** bounty
-("Build a GitHub-compatible git forge", $500).
+A single-process, GitHub-compatible git forge. One Node process serves git
+smart HTTP, the REST v3 API, the GraphQL v4 API and MCP over one in-memory
+store — no database, no git binary, no dependencies, no network.
 
-## What it serves
-
-- **Git smart HTTP** — `/{owner}/{repo}.git`: protocol v2 upload-pack
-  (`ls-refs`, `fetch` with shallow/deepen/thin-pack), v0 upload-pack
-  advertisement and fetch, v0 receive-pack (push) with report-status and
-  sideband-64k. Pack v2 read/write, ofs- and ref-deltas, fast-forward
-  enforcement (`non-fast-forward` per ref, mixed pushes apply the ok half).
-- **REST v3** — `/api/v3`: root/meta, users, repos, branches, commits, git
-  refs, contents (create/update/delete with base64 blobs), labels, issues
-  (+ comments, shared number counter with pull requests), pull requests
-  (files diff, three-way merge, squash via GraphQL), pagination with
-  absolute `Link` headers.
-- **GraphQL** — `/api/graphql`: `viewer`, `repository`, `node(id:)`,
-  `__type` introspection, issue/pull-request connections with cursor
-  pagination, and the `createIssue` / `closeIssue` / `createPullRequest` /
-  `mergePullRequest` / `addComment` mutations. Batched operation arrays
-  answer in order. Unknown fields are HTTP 200 with an `errors` array.
-- **MCP** — `/mcp`: JSON-RPC 2.0 streamable HTTP. Modern revision
-  `2026-07-28` via `server/discover`, legacy handshake revisions via
-  `initialize` + `notifications/initialized`. Six tools:
-  `create_repo`, `get_repo`, `create_issue`, `list_issues`,
-  `create_pull_request`, `merge_pull_request` — all acting on the same
-  in-memory store as REST, so ids are stable across surfaces.
-
-## Determinism
-
-The forge keeps all state in memory and never reads the wall clock or an
-unseeded random source: server commits use the fixed timestamp
-2025-01-01T00:00:00Z, request ids count up from 1, and fetch responses are
-sorted by object id. Two runs of the same trial leave byte-identical state.
-
-## Run
+## Run it
 
 ```sh
 node --experimental-strip-types main.ts
 ```
 
-Environment: `MAKEFUN_ENV_URL` (register + poll `/done`), `MAKEFUN_SHOP_TOKEN`
-(bearer token; empty means the checks run fail-open), `PORT` (optional;
-an ephemeral port is bound by default, never 8080).
+Without `MAKEFUN_ENV_URL` it runs in dev mode on an ephemeral port and prints
+the port and the dev token (`dev-token`). With `MAKEFUN_ENV_URL` set it binds
+an ephemeral port, registers it with the env, polls `/done` and exits 0.
+
+Environment:
+
+- `MAKEFUN_ENV_URL` — the trial env base URL (dev mode when unset).
+- `MAKEFUN_SHOP_TOKEN` — the Bearer/Basic token clients must present
+  (defaults to `dev-token` in dev mode).
 
 ## Layout
 
-- `main.ts` — lifecycle: bind, register, poll `/done`, exit 0.
-- `src/app.ts` — HTTP server + route wiring.
-- `src/seed.ts` — the deterministic scenario generator (FNV-1a, splitmix64,
-  xorshift64*; the viewer identity `adaiversen`).
-- `src/git.ts` — git objects, pkt-line, pack v2, deltas.
-- `src/store.ts` — in-memory repositories, git-graph operations, merge/diff,
-  JSON views.
-- `src/http.ts` — router, auth, request ids, pagination.
-- `src/githttp.ts` — smart-HTTP git (fetch planning, receive-pack).
-- `src/rest.ts` — REST v3.
-- `src/graphql.ts` — GraphQL executor.
-- `src/mcp.ts` — MCP endpoint.
-- `tests/` — smoke tests (stub environment + real `git` CLI).
+```
+main.ts            entrypoint: bind, register, poll /done, exit 0
+src/app.ts         HTTP wiring: auth, request ids, routing
+src/util.ts        SHA-1, ids, seeded PRNG, pkt-line framing
+src/objects.ts     git objects, pack v2 read/write, delta apply
+src/store.ts       in-memory store: repos, issues, PRs, labels, comments
+src/git.ts         smart HTTP: upload-pack v2/v0, receive-pack v0
+src/rest.ts        REST v3
+src/graphql.ts     GraphQL v4 (hand-rolled parser + executor)
+src/mcp.ts         MCP (JSON-RPC 2.0, streamable HTTP)
+tests/smoke.mjs    end-to-end smoke test (real git CLI)
+```
+
+## API surface
+
+- **Git smart HTTP** — `/{owner}/{repo}.git/info/refs` (v2 + v0
+  advertisements), `git-upload-pack` (v2 ls-refs/fetch/object-info,
+  v0 fetch), `git-receive-pack` (v0, per-ref fast-forward enforcement,
+  non-fast-forward refused). Pack v2 read/write with ofs- and ref-delta,
+  delta application, and a binary search for a zlib stream's end.
+- **REST v3** — `/api/v3/`: meta, rate limit, user, repos (CRUD, pagination
+  with `Link: rel="next"`), branches, commits, git refs/trees/blobs,
+  contents (PUT 201/200, stale-sha 409, DELETE), labels, issues + comments,
+  pulls (+ files, merge). Auth required everywhere except `/healthz`;
+  every reply carries `X-GitHub-Request-Id`; malformed JSON is 400.
+- **GraphQL v4** — `/api/graphql`: `viewer`, `repository` (+ issues,
+  pullRequests, pullRequest), `createIssue` / `createPullRequest`,
+  `__type` / `__schema` introspection, batched documents. Unknown fields
+  return HTTP 200 with `errors`; an unknown repo returns
+  `data.repository = null` without errors.
+- **MCP** — `/mcp`: `server/discover` (protocol versions 2026-07-28,
+  2025-11-25, 2025-06-18, 2025-03-26), legacy `initialize`, `tools/list`
+  (8 tools, byte-identical on repeat calls), `tools/call`. Missing required
+  arguments return `isError: true`; unknown tools return -32601.
+  Non-JSON bodies return 400 with -32700; missing auth returns 401.
+
+## Determinism
+
+Every stored timestamp is the fixed epoch 2025-01-01T00:00:00Z. No
+wall-clock time, no randomness in responses (request ids are a counter).
+The same sequence of requests always produces the same state.
+
+## Tests
+
+```sh
+node tests/smoke.mjs
+```
+
+Starts the real entrypoint in dev mode and checks REST, GraphQL, MCP and a
+real `git` CLI (clone, push, shallow clone, non-fast-forward refusal, tag
+push, pull-request merge). 74 checks, all passing.
 
 ---
 

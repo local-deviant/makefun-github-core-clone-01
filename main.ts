@@ -1,88 +1,87 @@
-// Entrypoint: node main.ts — the lifecycle the rules require. The forge binds
-// an ephemeral port (never 8080), registers it with the environment, then
-// polls /done until the environment says the trial is over and exits 0.
-// The token comes from MAKEFUN_SHOP_TOKEN; with no token the checks run
-// fail-open (auth accepts any request).
+// Entrypoint: the entry <-> env lifecycle, plus a dev mode that still serves when
+// MAKEFUN_ENV_URL is not set. Binds an ephemeral port, registers it, polls /done,
+// exits 0. Never binds 8080 (the env owns it).
 
-import { startForge } from './src/app.ts';
+import { createApp } from './src/app.ts';
+import { Store } from './src/store.ts';
 
-const envUrl = process.env.MAKEFUN_ENV_URL ?? '';
-const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-const explicitPort = process.env.PORT ? Number.parseInt(process.env.PORT, 10) : 0;
+const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+const REQUEST_TIMEOUT_MS = 30_000;
+const RETRY_INITIAL_MS = 250;
+const RETRY_MAX_MS = 2_000;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function postJson(url: string, body: unknown): Promise<{ status: number; text: string }> {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  return { status: response.status, text: await response.text() };
-}
-
-async function getJson(url: string): Promise<{ status: number; text: string }> {
-  const response = await fetch(url, { method: 'GET' });
-  return { status: response.status, text: await response.text() };
+function retryDelay(attempt: number): number {
+  return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
 }
 
 async function register(port: number): Promise<void> {
-  if (!envUrl) return;
-  const url = `${envUrl.replace(/\/+$/, '')}/register`;
-  let backoff = 250;
-  const started = Date.now();
-  for (;;) {
+  for (let attempt = 0; ; attempt += 1) {
     try {
-      const { status } = await postJson(url, { port });
-      if (status === 200 || status === 201 || status === 204) return;
-      if (status === 409) {
-        // Another register won the race; keep waiting for /done.
-        return;
-      }
-    } catch {
-      // The environment is not up yet; retry with backoff.
+      const res = await fetch(`${ENV_URL}/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ port }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (res.status === 200 || res.status === 409) return;
+      if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}`);
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
     }
-    if (Date.now() - started > 30_000) throw new Error(`could not register with ${url} within 30 s`);
-    await sleep(backoff);
-    backoff = Math.min(backoff * 2, 2000);
+    await sleep(retryDelay(attempt));
   }
 }
 
-async function waitDone(): Promise<void> {
-  if (!envUrl) return;
-  const url = `${envUrl.replace(/\/+$/, '')}/done`;
-  for (;;) {
+async function waitForDone(): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
     try {
-      const { status, text } = await getJson(url);
-      if (status === 200) {
-        const parsed: unknown = JSON.parse(text);
-        if (typeof parsed === 'object' && parsed !== null && (parsed as Record<string, unknown>).done === true) return;
+      const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      if (res.ok) {
+        const body = (await res.json()) as { done?: unknown };
+        if (body.done === true) return;
       }
     } catch {
-      // Transient; keep polling.
+      // Not done yet; poll again.
     }
-    await sleep(500);
+    await sleep(retryDelay(attempt));
   }
 }
 
 async function main(): Promise<void> {
-  const server = await startForge(token, explicitPort);
-  if (!envUrl) {
-    // No environment to report to: serve until killed (local development).
+  const store = new Store();
+  const token = TOKEN === '' ? 'dev-token' : TOKEN;
+  const server = createApp(store, { token });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, () => resolve());
+  });
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
+  process.stdout.write(`[entry] listening on port ${address.port}\n`);
+
+  if (ENV_URL === '') {
+    // Dev mode: no env to register with; serve until interrupted.
+    process.stdout.write(`[entry] dev mode: token is ${token}\n`);
+    await new Promise<void>(() => {
+      // Keep the process alive; SIGINT/SIGTERM end it.
+    });
     return;
   }
-  try {
-    await register(server.port);
-    await waitDone();
-  } finally {
-    await server.close();
-  }
-  process.exit(0);
+
+  await register(address.port);
+  process.stdout.write('[entry] registered; waiting for the env to say done\n');
+  await waitForDone();
+  server.close();
+  process.stdout.write('[entry] done\n');
 }
 
-main().catch((err: unknown) => {
-  console.error(err instanceof Error ? err.stack ?? err.message : String(err));
+try {
+  await main();
+  process.exit(0);
+} catch (err) {
+  process.stderr.write(`[entry] ${err instanceof Error ? err.message : String(err)}\n`);
   process.exit(1);
-});
+}
