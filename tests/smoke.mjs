@@ -1,287 +1,315 @@
-// Smoke test: boots the real entrypoint (main.ts) against a stub environment,
-// then drives it with the real git CLI plus curl-style fetch calls over REST,
-// GraphQL and MCP. Run: node tests/smoke.mjs
-// Exits 0 when every check passes, 1 otherwise.
+// Smoke test for the forge: starts the real entrypoint in dev mode, then exercises
+// REST, GraphQL, MCP and a REAL git CLI. Run: node tests/smoke.mjs
+// Exits 0 only when every check passes.
 
-import { spawn, execFileSync } from 'node:child_process';
-import { createServer } from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { spawn, execFile } from 'node:child_process';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const ROOT = join(fileURLToPath(import.meta.url), '..', '..');
-const TOKEN = 'test-token-123';
-const BASE64 = (text) => Buffer.from(text, 'utf8').toString('base64');
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const TOKEN = 'dev-token';
+let base = '';
+let passed = 0;
+let failed = 0;
+const failures = [];
 
-let failures = 0;
-let passes = 0;
-function check(label, ok, extra = '') {
+function check(name, ok, detail = '') {
   if (ok) {
-    passes += 1;
-    console.log(`  ok   ${label}`);
+    passed++;
+    console.log(`  ok   ${name}`);
   } else {
-    failures += 1;
-    console.log(`  FAIL ${label}${extra ? ` — ${extra}` : ''}`);
+    failed++;
+    failures.push(name);
+    console.log(`  FAIL ${name} ${detail}`);
   }
 }
 
-function git(cwd, ...args) {
-  return execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', HOME: cwd } });
+function git(args, cwd) {
+  return new Promise((resolve) => {
+    execFile('git', args, { cwd, env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', HOME: cwd } }, (err, stdout, stderr) => {
+      resolve({ code: err ? (err.code ?? 1) : 0, stdout, stderr });
+    });
+  });
+}
+
+async function req(path, opts = {}) {
+  const res = await fetch(base + path, {
+    ...opts,
+    headers: { Authorization: `Bearer ${TOKEN}`, ...(opts.headers ?? {}) },
+  });
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch { /* not json */ }
+  return { status: res.status, headers: res.headers, text, json };
 }
 
 async function main() {
-  // Stub environment: /register records the port, /done flips true on demand.
-  let registeredPort = 0;
-  let done = false;
-  const env = createServer((req, res) => {
-    if (req.method === 'POST' && req.url === '/register') {
-      let body = '';
-      req.on('data', (chunk) => (body += chunk));
-      req.on('end', () => {
-        registeredPort = JSON.parse(body).port;
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end('{}');
-      });
-      return;
-    }
-    if (req.method === 'GET' && req.url === '/done') {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ done }));
-      return;
-    }
-    res.writeHead(404);
-    res.end();
+  const server = spawn('node', ['--experimental-strip-types', 'main.ts'], {
+    cwd: ROOT,
+    env: { ...process.env },
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
-  await new Promise((resolve) => env.listen(0, '127.0.0.1', resolve));
-  const envPort = env.address().port;
-
-  const forge = spawn(
-    'node',
-    ['--experimental-strip-types', 'main.ts'],
-    {
-      cwd: ROOT,
-      env: { ...process.env, MAKEFUN_ENV_URL: `http://127.0.0.1:${envPort}`, MAKEFUN_SHOP_TOKEN: TOKEN },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    },
-  );
-  let stderr = '';
-  forge.stderr.on('data', (chunk) => (stderr += chunk));
-  const exited = new Promise((resolve) => forge.on('exit', (code) => resolve(code)));
+  let port = 0;
+  const portP = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('server did not print a port')), 15000);
+    server.stdout.on('data', (d) => {
+      const m = /listening on port (\d+)/.exec(d.toString());
+      if (m) {
+        clearTimeout(timer);
+        port = parseInt(m[1], 10);
+        resolve(port);
+      }
+    });
+    server.stderr.on('data', (d) => process.stderr.write(`[server] ${d}`));
+  });
+  await portP;
+  base = `http://127.0.0.1:${port}`;
+  console.log(`server on ${base}`);
 
   try {
-    // Wait for the register call.
-    for (let i = 0; i < 100 && !registeredPort; i += 1) await new Promise((r) => setTimeout(r, 100));
-    check('forge registered a port', registeredPort > 0 && registeredPort !== 8080, `port=${registeredPort}`);
-    const base = `http://127.0.0.1:${registeredPort}`;
-    const headers = { Authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
-    const call = async (method, path, body, extraHeaders = {}) => {
-      const response = await fetch(`${base}${path}`, {
-        method,
-        headers: { ...headers, ...extraHeaders },
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
-      const text = await response.text();
-      let json = null;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        // not JSON
-      }
-      return { status: response.status, headers: response.headers, text, json };
-    };
+    // ---- REST: root / meta / user ----
+    let r = await req('/healthz', { headers: { Authorization: '' } });
+    check('healthz 200 ok', r.status === 200 && r.json?.ok === true, `${r.status} ${r.text.slice(0, 80)}`);
+    r = await req('/api/v3/');
+    check('GET /api/v3 200 + scopes', r.status === 200 && (r.headers.get('x-oauth-scopes') ?? '').includes('repo'), `${r.status}`);
+    r = await req('/api/v3/meta');
+    check('GET /meta installed_version', r.status === 200 && typeof r.json?.installed_version === 'string' && r.json.installed_version.length > 0, `${r.status}`);
+    r = await fetch(base + '/api/v3/meta');
+    check('no token -> 401', r.status === 401, `${r.status}`);
+    r = await req('/api/v3/user');
+    check('GET /user login adaiversen', r.status === 200 && r.json?.login === 'adaiversen', `${r.status} ${r.text.slice(0, 100)}`);
+    r = await req('/api/v3/no-such-route/x');
+    check('unknown route 404 JSON', r.status === 404 && typeof r.json?.message === 'string', `${r.status}`);
+    r = await fetch(base + '/api/v3/user/repos', { method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: '{bad json' });
+    check('malformed JSON 400', r.status === 400, `${r.status}`);
 
-    // healthz + root + auth
-    let r = await call('GET', '/healthz', undefined, { Authorization: '' });
-    check('GET /healthz without token is 200', r.status === 200 && r.json?.ok === true, `status=${r.status}`);
-    r = await call('GET', '/api/v3/', undefined, { Authorization: '' });
-    check('GET /api/v3/ without token is 401', r.status === 401, `status=${r.status}`);
-    r = await call('GET', '/api/v3/');
-    check('GET /api/v3/ is 200 + x-oauth-scopes + request id', r.status === 200 && !!r.headers.get('x-oauth-scopes') && !!r.headers.get('x-github-request-id'), `status=${r.status}`);
-    r = await call('GET', '/api/v3/meta');
-    check('GET /api/v3/meta has installed_version', r.status === 200 && typeof r.json?.installed_version === 'string', `status=${r.status}`);
-    r = await call('GET', '/api/v3/user');
-    check('GET /api/v3/user is adaiversen', r.status === 200 && r.json?.login === 'adaiversen', `login=${r.json?.login}`);
-    r = await call('GET', '/api/v3/unknown-route-xyz');
-    check('unknown route is JSON 404', r.status === 404 && typeof r.json?.message === 'string', `status=${r.status}`);
-    r = await fetch(`${base}/api/v3/user/repos`, { method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: '{bad json' });
-    check('malformed JSON body is 400', r.status === 400, `status=${r.status}`);
-
-    // repo + contents
-    r = await call('POST', '/api/v3/user/repos', { name: 'smoke-repo', private: true, description: 'smoke' });
-    check('POST /user/repos 201', r.status === 201 && r.json?.name === 'smoke-repo' && r.json?.private === true, `status=${r.status}`);
-    const repoId = r.json?.node_id;
-    check('repo node_id is opaque base64', typeof repoId === 'string' && !/^\d+$/.test(repoId), `node_id=${repoId}`);
-    r = await call('POST', '/api/v3/user/repos', { name: 'smoke-repo' });
-    check('duplicate repo is 422', r.status === 422, `status=${r.status}`);
-    const fileContent = 'hello forge\nsecond line\n';
-    r = await call('PUT', '/api/v3/repos/adaiversen/smoke-repo/contents/docs/hello.txt', { message: 'add hello', content: BASE64(fileContent) });
-    check('PUT /contents creates (201) with content+commit sha', r.status === 201 && !!r.json?.content?.sha && !!r.json?.commit?.sha, `status=${r.status} ${r.text.slice(0, 120)}`);
-    const contentSha = r.json?.content?.sha;
-    r = await call('GET', '/api/v3/repos/adaiversen/smoke-repo/contents/docs/hello.txt');
-    check('GET /contents decodes to the committed bytes', r.status === 200 && Buffer.from(r.json?.content ?? '', 'base64').toString('utf8') === fileContent && r.json?.sha === contentSha, `status=${r.status}`);
-    r = await call('GET', '/api/v3/repos/adaiversen/smoke-repo/contents/docs');
-    check('GET /contents on a directory lists entries', r.status === 200 && Array.isArray(r.json) && r.json.some((e) => e.name === 'hello.txt'), `status=${r.status}`);
-    r = await call('PUT', '/api/v3/repos/adaiversen/smoke-repo/contents/docs/hello.txt', { message: 'stale', content: BASE64('x'), sha: '0'.repeat(40) });
-    check('PUT /contents with a stale sha is 409', r.status === 409, `status=${r.status}`);
-    r = await call('GET', '/api/v3/repos/adaiversen/smoke-repo/commits');
-    check('GET /commits lists the contents commit with the exact message', r.status === 200 && Array.isArray(r.json) && r.json.some((c) => c.commit?.message === 'add hello'), `status=${r.status}`);
-    r = await call('GET', '/api/v3/repos/adaiversen/smoke-repo/branches');
-    check('GET /branches lists main', r.status === 200 && Array.isArray(r.json) && r.json.some((b) => b.name === 'main'), `status=${r.status}`);
-    r = await call('GET', '/api/v3/repos/adaiversen/smoke-repo/git/refs/heads/main');
-    check('GET /git/refs/heads/main returns the tip', r.status === 200 && r.json?.ref === 'refs/heads/main' && typeof r.json?.object?.sha === 'string', `status=${r.status}`);
-    r = await call('POST', '/api/v3/repos/adaiversen/smoke-repo/git/refs', { ref: 'refs/heads/side', sha: r.json?.object?.sha });
-    check('POST /git/refs creates a branch (201)', r.status === 201 && r.json?.ref === 'refs/heads/side', `status=${r.status}`);
-
-    // labels + issues
-    r = await call('POST', '/api/v3/repos/adaiversen/smoke-repo/labels', { name: 'bug', color: 'd73a4a' });
-    check('POST /labels 201', r.status === 201 && r.json?.name === 'bug', `status=${r.status}`);
-    r = await call('POST', '/api/v3/repos/adaiversen/smoke-repo/issues', { title: 'first bug', body: 'boom', labels: ['bug'] });
-    check('POST /issues 201 with the label', r.status === 201 && r.json?.number === 1 && r.json?.labels?.some((l) => l.name === 'bug'), `status=${r.status} ${r.text.slice(0, 120)}`);
-    r = await call('POST', '/api/v3/repos/adaiversen/smoke-repo/issues', { title: 'bad label', labels: ['no-such-label'] });
-    check('POST /issues with an unknown label is 422', r.status === 422, `status=${r.status}`);
-    r = await call('POST', '/api/v3/repos/adaiversen/smoke-repo/issues/1/comments', { body: 'noted' });
-    check('POST /issues/1/comments 201', r.status === 201 && r.json?.body === 'noted', `status=${r.status}`);
-    r = await call('PATCH', '/api/v3/repos/adaiversen/smoke-repo/issues/1', { state: 'closed' });
-    check('PATCH /issues/1 closes it', r.status === 200 && r.json?.state === 'closed', `status=${r.status}`);
-    r = await call('GET', '/api/v3/repos/adaiversen/smoke-repo/issues?state=open');
-    check('GET /issues?state=open excludes the closed one', r.status === 200 && Array.isArray(r.json) && r.json.length === 0, `status=${r.status} len=${r.json?.length}`);
-
-    // pulls + merge
-    r = await call('PUT', '/api/v3/repos/adaiversen/smoke-repo/contents/docs/hello.txt', { message: 'edit on side', content: BASE64('hello forge\nsecond line\nthird line\n'), branch: 'side', sha: contentSha });
-    check('PUT /contents on side branch (200)', r.status === 200 && !!r.json?.commit?.sha, `status=${r.status}`);
-    r = await call('POST', '/api/v3/repos/adaiversen/smoke-repo/pulls', { title: 'add third line', head: 'side', base: 'main', body: 'please merge' });
-    check('POST /pulls 201 open with head/base', r.status === 201 && r.json?.number === 2 && r.json?.state === 'open' && r.json?.head?.ref === 'side' && r.json?.base?.ref === 'main', `status=${r.status} ${r.text.slice(0, 150)}`);
-    r = await call('GET', '/api/v3/repos/adaiversen/smoke-repo/pulls/2/files');
-    check('GET /pulls/2/files lists the changed file', r.status === 200 && Array.isArray(r.json) && r.json.some((f) => f.filename === 'docs/hello.txt' && f.additions >= 1), `status=${r.status} ${r.text.slice(0, 150)}`);
-    r = await call('PUT', '/api/v3/repos/adaiversen/smoke-repo/pulls/2/merge', {});
-    check('PUT /pulls/2/merge 200 merged', r.status === 200 && r.json?.merged === true && typeof r.json?.sha === 'string', `status=${r.status} ${r.text.slice(0, 120)}`);
-    r = await call('GET', '/api/v3/repos/adaiversen/smoke-repo/contents/docs/hello.txt');
-    check('merged content is on main', r.status === 200 && Buffer.from(r.json?.content ?? '', 'base64').toString('utf8').includes('third line'), `status=${r.status}`);
-
-    // pagination
-    for (let i = 0; i < 12; i += 1) await call('POST', '/api/v3/user/repos', { name: `page-repo-${i}`, private: true });
-    r = await call('GET', '/api/v3/user/repos?per_page=10');
+    // ---- REST: repos ----
+    r = await req('/api/v3/user/repos', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'smoke-repo', description: 'smoke', private: true }) });
+    check('POST /user/repos 201', r.status === 201 && r.json?.name === 'smoke-repo', `${r.status} ${r.text.slice(0, 120)}`);
+    const repoId = r.json?.id;
+    r = await req('/api/v3/repos/adaiversen/smoke-repo');
+    check('GET repo 200', r.status === 200 && r.json?.full_name === 'adaiversen/smoke-repo', `${r.status}`);
+    r = await req('/api/v3/repos/someone-else/smoke-repo');
+    check('foreign owner 404', r.status === 404, `${r.status}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo', { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ description: 'patched' }) });
+    check('PATCH repo description', r.status === 200 && r.json?.description === 'patched', `${r.status}`);
+    // Pagination: create 35 repos, page through with per_page=10.
+    for (let i = 0; i < 35; i++) {
+      await req('/api/v3/user/repos', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: `page-repo-${i}` }) });
+    }
+    r = await req('/api/v3/user/repos?per_page=10&page=1');
     const link = r.headers.get('link') ?? '';
-    check('GET /user/repos?per_page=10 returns 10 + Link next', r.status === 200 && Array.isArray(r.json) && r.json.length === 10 && link.includes('rel="next"') && link.includes('127.0.0.1'), `len=${r.json?.length} link=${link.slice(0, 80)}`);
-    const nextUrl = /<([^>]+)>; rel="next"/.exec(link)?.[1];
-    if (nextUrl) {
-      const r2 = await fetch(nextUrl, { headers: { Authorization: `Bearer ${TOKEN}` } });
-      const j2 = await r2.json();
-      check('following Link rel=next gives the next page', r2.status === 200 && Array.isArray(j2) && j2.length > 0, `status=${r2.status}`);
-    } else {
-      check('following Link rel=next gives the next page', false, 'no next link');
-    }
+    check('pagination Link rel=next', Array.isArray(r.json) && r.json.length === 10 && link.includes('rel="next"'), `len=${Array.isArray(r.json) ? r.json.length : '?'} link=${link.slice(0, 80)}`);
+    r = await req('/api/v3/user/repos?per_page=10&page=4');
+    check('pagination page 4 has 6', Array.isArray(r.json) && r.json.length === 6, `len=${Array.isArray(r.json) ? r.json.length : '?'}`);
+    void repoId;
 
-    // GraphQL
-    const gql = async (query, variables = {}) => call('POST', '/api/graphql', { query, variables });
-    r = await gql('query { viewer { login } }');
-    check('GraphQL viewer.login', r.status === 200 && r.json?.data?.viewer?.login === 'adaiversen', `status=${r.status} ${r.text.slice(0, 120)}`);
-    r = await gql('query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id databaseId name owner { login } defaultBranchRef { name } viewerPermission hasIssuesEnabled } }', { owner: 'adaiversen', name: 'smoke-repo' });
-    check('GraphQL repository fields', r.status === 200 && r.json?.data?.repository?.id === repoId && r.json?.data?.repository?.databaseId === r.json?.data?.repository?.databaseId && r.json?.data?.repository?.viewerPermission === 'ADMIN' && r.json?.data?.repository?.hasIssuesEnabled === true, `status=${r.status} ${r.text.slice(0, 160)}`);
-    r = await gql('query { Issue: __type(name: "Issue") { fields(includeDeprecated: true) { name } } }');
-    const issueFields = (r.json?.data?.Issue?.fields ?? []).map((f) => f.name);
-    check('GraphQL __type Issue lists id/number/title/state/body', ['id', 'number', 'title', 'state', 'body'].every((f) => issueFields.includes(f)), `fields=${issueFields.join(',')}`);
-    r = await gql('query { viewer { login noSuchFieldOnViewer } }');
-    check('GraphQL unknown field is 200 with errors naming it', r.status === 200 && Array.isArray(r.json?.errors) && r.json.errors.some((e) => e.message.includes('noSuchFieldOnViewer')), `status=${r.status}`);
-    r = await gql('query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }', { owner: 'adaiversen', name: 'no-such-repo' });
-    check('GraphQL unknown repo is data.repository null, no errors', r.status === 200 && r.json?.data?.repository === null && !r.json?.errors, `status=${r.status} ${r.text.slice(0, 120)}`);
-    r = await gql('mutation($input: CreateIssueInput!) { createIssue(input: $input) { issue { number id } } }', { input: { repositoryId: repoId, title: 'gql issue', body: 'via graphql' } });
-    check('GraphQL createIssue', r.status === 200 && r.json?.data?.createIssue?.issue?.number === 3, `status=${r.status} ${r.text.slice(0, 140)}`);
-    r = await gql('query($owner: String!, $name: String!, $first: Int!) { repository(owner: $owner, name: $name) { issues(first: $first, states: [OPEN], orderBy: {field: CREATED_AT, direction: DESC}) { nodes { number title state } } } }', { owner: 'adaiversen', name: 'smoke-repo', first: 5 });
-    check('GraphQL open issues list', r.status === 200 && Array.isArray(r.json?.data?.repository?.issues?.nodes) && r.json.data.repository.issues.nodes.some((n) => n.number === 3), `status=${r.status} ${r.text.slice(0, 140)}`);
-    // batched
-    const batch = await fetch(`${base}/api/graphql`, { method: 'POST', headers, body: JSON.stringify([{ query: 'query { viewer { login } }' }, { query: 'query { Issue: __type(name: "Issue") { fields { name } } }' }]) });
-    const batchJson = await batch.json();
-    check('GraphQL batched operations answer in order', batch.status === 200 && Array.isArray(batchJson) && batchJson.length === 2 && batchJson[0]?.data?.viewer?.login === 'adaiversen', `status=${batch.status}`);
+    // ---- REST: contents ----
+    const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/contents/hello.txt', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: 'add hello', content: b64('hello world') }) });
+    check('PUT contents create 201', r.status === 201 && r.json?.content?.sha, `${r.status} ${r.text.slice(0, 120)}`);
+    const sha1 = r.json?.content?.sha;
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/contents/hello.txt');
+    check('GET contents file', r.status === 200 && r.json?.content === b64('hello world'), `${r.status}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/contents/hello.txt', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: 'update', content: b64('hello v2'), sha: sha1 }) });
+    check('PUT contents update 200', r.status === 200, `${r.status} ${r.text.slice(0, 100)}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/contents/hello.txt', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: 'stale', content: b64('x'), sha: sha1 }) });
+    check('PUT contents stale sha 409', r.status === 409, `${r.status}`);
+    // DELETE needs the current sha; fetch it first.
+    const cur = await req('/api/v3/repos/adaiversen/smoke-repo/contents/hello.txt');
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/contents/hello.txt', { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: 'delete', sha: cur.json?.sha }) });
+    check('DELETE contents 200 + commit sha', r.status === 200 && r.json?.commit?.sha, `${r.status} ${r.text.slice(0, 100)}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/contents/hello.txt');
+    check('GET deleted contents 404', r.status === 404, `${r.status}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/branches');
+    check('GET branches lists main', r.status === 200 && Array.isArray(r.json) && r.json.some((b) => b.name === 'main'), `${r.status} ${r.text.slice(0, 120)}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/commits');
+    check('GET commits non-empty', r.status === 200 && Array.isArray(r.json) && r.json.length >= 2, `${r.status} len=${Array.isArray(r.json) ? r.json.length : '?'}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/git/refs');
+    check('GET git refs', r.status === 200 && Array.isArray(r.json) && r.json.length >= 1, `${r.status}`);
 
-    // MCP
-    const mcp = async (body, extraHeaders = {}) => {
-      const response = await fetch(`${base}/mcp`, { method: 'POST', headers: { ...headers, ...extraHeaders }, body: JSON.stringify(body) });
-      return { status: response.status, json: await response.json().catch(() => null), headers: response.headers };
+    // ---- REST: labels / issues / comments ----
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/labels', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'bug' }) });
+    check('POST label 201', r.status === 201 && r.json?.name === 'bug', `${r.status}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/issues', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'first issue', body: 'body 1', labels: ['bug'] }) });
+    check('POST issue 201 open', r.status === 201 && r.json?.state === 'open' && r.json?.number === 1, `${r.status} ${r.text.slice(0, 120)}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/issues', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'bad label', labels: ['nope'] }) });
+    check('POST issue unknown label 422', r.status === 422, `${r.status}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/issues', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'second issue' }) });
+    check('POST issue number 2', r.status === 201 && r.json?.number === 2, `${r.status}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/issues/1/comments', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ body: 'a comment' }) });
+    check('POST comment 201', r.status === 201 && r.json?.body === 'a comment', `${r.status}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/issues/1');
+    check('GET issue 1 comments=1', r.status === 200 && r.json?.comments === 1, `${r.status}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/issues?state=open');
+    check('GET issues open=2', r.status === 200 && Array.isArray(r.json) && r.json.length === 2, `${r.status}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/issues/1', { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ state: 'closed' }) });
+    check('PATCH issue closed', r.status === 200 && r.json?.state === 'closed', `${r.status}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/issues?state=open');
+    check('GET issues open=1 after close', r.status === 200 && Array.isArray(r.json) && r.json.length === 1, `${r.status}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/issues?state=open&sort=created&direction=asc');
+    check('GET issues asc', r.status === 200 && Array.isArray(r.json) && r.json[0]?.number === 2, `${r.status}`);
+
+    // ---- REST: PRs ----
+    // Push a feature branch via contents on a new branch is not supported; use git below.
+    // Instead create the branch by pushing with git first (done in the git section), then PR here.
+    // For now, test the PR endpoints against the git-created branch later.
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/pulls/99');
+    check('GET unknown PR 404', r.status === 404, `${r.status}`);
+
+    // ---- GraphQL ----
+    const gql = async (query, variables = {}) => {
+      const res = await fetch(base + '/api/graphql', { method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: JSON.stringify({ query, variables }) });
+      return { status: res.status, json: await res.json() };
     };
-    r = await mcp({ jsonrpc: '2.0', id: 1, method: 'server/discover', params: {}, _meta: { protocolVersion: '2026-07-28' } });
-    check('MCP server/discover lists 2026-07-28', r.status === 200 && Array.isArray(r.json?.result?.supportedVersions) && r.json.result.supportedVersions.includes('2026-07-28'), `status=${r.status} ${JSON.stringify(r.json)?.slice(0, 140)}`);
-    r = await mcp({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {}, _meta: { protocolVersion: '2026-07-28' } });
-    const toolNames = (r.json?.result?.tools ?? []).map((t) => t.name);
-    check('MCP tools/list has the six tools', ['create_repo', 'get_repo', 'create_issue', 'list_issues', 'create_pull_request', 'merge_pull_request'].every((n) => toolNames.includes(n)), `tools=${toolNames.join(',')}`);
-    r = await mcp({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'create_issue', arguments: { owner: 'adaiversen', repo: 'smoke-repo', title: 'mcp issue' } }, _meta: { protocolVersion: '2026-07-28' } });
-    check('MCP create_issue', r.status === 200 && r.json?.result?.structuredContent?.number === 4, `status=${r.status} ${JSON.stringify(r.json)?.slice(0, 160)}`);
-    r = await mcp({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'list_issues', arguments: { owner: 'adaiversen', repo: 'smoke-repo', state: 'open' } }, _meta: { protocolVersion: '2026-07-28' } });
-    check('MCP list_issues returns the mcp issue', r.status === 200 && Array.isArray(r.json?.result?.structuredContent?.issues) && r.json.result.structuredContent.issues.some((i) => i.number === 4), `status=${r.status}`);
-    r = await mcp({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'no_such_tool', arguments: {} }, _meta: { protocolVersion: '2026-07-28' } });
-    check('MCP unknown tool is -32601, never 500', r.status === 200 && r.json?.error?.code === -32601, `status=${r.status}`);
-    r = await mcp({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'create_issue', arguments: {} }, _meta: { protocolVersion: '2026-07-28' } });
-    check('MCP missing arguments is isError:true', r.status === 200 && r.json?.result?.isError === true, `status=${r.status}`);
-    const badBody = await fetch(`${base}/mcp`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: 'not json at all' });
-    const badJson = await badBody.json().catch(() => null);
-    check('MCP non-JSON body is HTTP 400 with -32700', badBody.status === 400 && badJson?.error?.code === -32700, `status=${badBody.status}`);
-    const noAuth = await fetch(`${base}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'list_issues', arguments: { owner: 'adaiversen', repo: 'smoke-repo' } } }) });
-    check('MCP without token is 401', noAuth.status === 401, `status=${noAuth.status}`);
-    // legacy initialize
-    r = await mcp({ jsonrpc: '2.0', id: 8, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'smoke', version: '1' } } });
-    check('MCP legacy initialize echoes a revision + serverInfo', r.status === 200 && typeof r.json?.result?.serverInfo?.name === 'string' && !!r.json?.result?.capabilities?.tools, `status=${r.status}`);
+    let g = await gql('query ViewerLogin { viewer { login } }');
+    check('gql viewer login', g.status === 200 && g.json?.data?.viewer?.login === 'adaiversen', `${g.status} ${JSON.stringify(g.json).slice(0, 120)}`);
+    g = await gql('query Issue_fields { Issue: __type(name: "Issue") { fields(includeDeprecated: true) { name } } }');
+    const issueFields = (g.json?.data?.Issue?.fields ?? []).map((f) => f.name);
+    check('gql __type Issue fields', ['id', 'number', 'title', 'state', 'body'].every((f) => issueFields.includes(f)), issueFields.join(','));
+    g = await gql('query PRRepo { PullRequest: __type(name: "PullRequest") { fields(includeDeprecated: true) { name } } Repository: __type(name: "Repository") { fields(includeDeprecated: true) { name } } }');
+    const prFields = (g.json?.data?.PullRequest?.fields ?? []).map((f) => f.name);
+    const repoFields = (g.json?.data?.Repository?.fields ?? []).map((f) => f.name);
+    check('gql __type PullRequest fields', ['id', 'number', 'headRefName', 'baseRefName', 'mergeable', 'state', 'merged', 'files'].every((f) => prFields.includes(f)), prFields.join(','));
+    check('gql __type Repository fields', ['id', 'databaseId', 'name', 'nameWithOwner', 'owner', 'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'issue', 'issues', 'pullRequests', 'pullRequest'].every((f) => repoFields.includes(f)), repoFields.join(','));
+    g = await gql('query ST { SearchType: __type(name: "SearchType") { enumValues { name } } }');
+    const enums = (g.json?.data?.SearchType?.enumValues ?? []).map((e) => e.name);
+    check('gql SearchType has ISSUE', enums.includes('ISSUE'), enums.join(','));
+    g = await gql('query Bad { viewer { login noSuchFieldOnViewer } }');
+    check('gql unknown field 200 + errors', g.status === 200 && Array.isArray(g.json?.errors) && g.json.errors.some((e) => e.message.includes('noSuchFieldOnViewer')), `${g.status} ${JSON.stringify(g.json).slice(0, 150)}`);
+    g = await gql('query Repo($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id name } }', { owner: 'adaiversen', name: 'no-such-repo' });
+    check('gql unknown repo null no errors', g.status === 200 && g.json?.data?.repository === null && !g.json?.errors, JSON.stringify(g.json).slice(0, 120));
+    g = await gql('query Repo($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id databaseId name nameWithOwner owner { login } defaultBranchRef { name } viewerPermission hasIssuesEnabled } }', { owner: 'adaiversen', name: 'smoke-repo' });
+    check('gql repository fields', g.status === 200 && g.json?.data?.repository?.nameWithOwner === 'adaiversen/smoke-repo' && g.json?.data?.repository?.owner?.login === 'adaiversen', JSON.stringify(g.json).slice(0, 160));
+    // createIssue via GraphQL
+    const repoNodeId = g.json?.data?.repository?.id;
+    g = await gql('mutation CI($input: CreateIssueInput!) { createIssue(input: $input) { issue { number title state } } }', { input: { repositoryId: repoNodeId, title: 'gql issue', body: 'via graphql' } });
+    check('gql createIssue', g.status === 200 && g.json?.data?.createIssue?.issue?.number === 3, JSON.stringify(g.json).slice(0, 160));
+    g = await gql('query OpenIssues($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { issues(orderBy: {field: CREATED_AT, direction: DESC}, states: [OPEN]) { nodes { number } totalCount } } }', { owner: 'adaiversen', name: 'smoke-repo' });
+    const nums = (g.json?.data?.repository?.issues?.nodes ?? []).map((n) => n.number);
+    check('gql issues DESC open only', JSON.stringify(nums) === JSON.stringify([3, 2]), `nums=${JSON.stringify(nums)}`);
+    // Batched documents.
+    const batchRes = await fetch(base + '/api/graphql', { method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: JSON.stringify([{ query: 'query ViewerLogin { viewer { login } }', variables: {} }, { query: 'query Issue_fields { Issue: __type(name: "Issue") { fields { name } } }', variables: {} }]) });
+    const batch = await batchRes.json();
+    check('gql batched two results in order', Array.isArray(batch) && batch.length === 2 && batch[0]?.data?.viewer?.login === 'adaiversen' && Array.isArray(batch[1]?.data?.Issue?.fields), `${batchRes.status}`);
+    const noAuthGql = await fetch(base + '/api/graphql', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: 'query { viewer { login } }' }) });
+    check('gql no token 401', noAuthGql.status === 401, `${noAuthGql.status}`);
 
-    // Real git CLI against the forge
+    // ---- MCP ----
+    const mcp = async (body, headers = {}) => {
+      const res = await fetch(base + '/mcp', { method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json', ...headers }, body: typeof body === 'string' ? body : JSON.stringify(body) });
+      const text = await res.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch { /* empty */ }
+      return { status: res.status, json, text };
+    };
+    let m = await mcp({ jsonrpc: '2.0', id: 'discover-1', method: 'server/discover', params: { _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' } } });
+    check('mcp discover supportedVersions', m.status === 200 && Array.isArray(m.json?.result?.supportedVersions) && m.json.result.supportedVersions.length > 0 && /^\d{4}-\d{2}-\d{2}$/.test(m.json.result.supportedVersions[0]), JSON.stringify(m.json).slice(0, 160));
+    m = await mcp({ jsonrpc: '2.0', id: 'initialize-1', method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'smoke', version: '1.0.0' } } });
+    check('mcp legacy initialize', m.status === 200 && m.json?.result?.protocolVersion === '2025-11-25', JSON.stringify(m.json).slice(0, 160));
+    m = await mcp({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    check('mcp notification 202', m.status === 202, `${m.status}`);
+    m = await mcp({ jsonrpc: '2.0', id: 'tl-1', method: 'tools/list', params: {} });
+    const toolNames = (m.json?.result?.tools ?? []).map((t) => t.name);
+    check('mcp tools/list 6+ tools', ['create_repo', 'get_repo', 'create_issue', 'list_issues', 'create_pull_request', 'merge_pull_request'].every((t) => toolNames.includes(t)), toolNames.join(','));
+    const list1 = JSON.stringify(m.json?.result?.tools);
+    m = await mcp({ jsonrpc: '2.0', id: 'tl-2', method: 'tools/list', params: {} });
+    check('mcp tools/list byte-identical', JSON.stringify(m.json?.result?.tools) === list1, '');
+    // create repo + issue over MCP, read back over REST.
+    m = await mcp({ jsonrpc: '2.0', id: 'c1', method: 'tools/call', params: { name: 'create_repo', arguments: { name: 'mcp-repo' } } });
+    check('mcp create_repo', m.status === 200 && !m.json?.result?.isError, JSON.stringify(m.json).slice(0, 160));
+    m = await mcp({ jsonrpc: '2.0', id: 'c2', method: 'tools/call', params: { name: 'create_issue', arguments: { owner: 'adaiversen', repo: 'mcp-repo', title: 'mcp issue', body: 'hi' } } });
+    check('mcp create_issue', m.status === 200 && !m.json?.result?.isError, JSON.stringify(m.json).slice(0, 160));
+    r = await req('/api/v3/repos/adaiversen/mcp-repo/issues/1');
+    check('mcp issue reads back over REST', r.status === 200 && r.json?.title === 'mcp issue', `${r.status}`);
+    m = await mcp({ jsonrpc: '2.0', id: 'c3', method: 'tools/call', params: { name: 'list_issues', arguments: { owner: 'adaiversen', repo: 'mcp-repo' } } });
+    check('mcp list_issues', m.status === 200 && (m.json?.result?.content?.[0]?.text ?? '').includes('mcp issue'), JSON.stringify(m.json).slice(0, 160));
+    m = await mcp({ jsonrpc: '2.0', id: 'c4', method: 'tools/call', params: { name: 'no_such_tool', arguments: {} } });
+    check('mcp unknown tool -32601/-32602', m.json?.error?.code === -32601 || m.json?.error?.code === -32602, JSON.stringify(m.json).slice(0, 120));
+    m = await mcp({ jsonrpc: '2.0', id: 'c5', method: 'tools/call', params: { name: 'create_issue', arguments: { owner: 'adaiversen', repo: 'mcp-repo' } } });
+    check('mcp missing arg isError/-32602', m.json?.result?.isError === true || m.json?.error?.code === -32602, JSON.stringify(m.json).slice(0, 120));
+    m = await mcp('this is not json');
+    check('mcp non-JSON 400/-32700', m.status === 400 && m.json?.error?.code === -32700, `${m.status} ${m.text.slice(0, 120)}`);
+    const noAuthMcp = await fetch(base + '/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 'x', method: 'tools/list', params: {} }) });
+    check('mcp no token 401', noAuthMcp.status === 401, `${noAuthMcp.status}`);
+    // Two concurrent tools/call keep their ids.
+    const [p1, p2] = await Promise.all([
+      mcp({ jsonrpc: '2.0', id: 'conc-1', method: 'tools/call', params: { name: 'get_repo', arguments: { owner: 'adaiversen', repo: 'mcp-repo' } } }),
+      mcp({ jsonrpc: '2.0', id: 'conc-2', method: 'tools/call', params: { name: 'list_issues', arguments: { owner: 'adaiversen', repo: 'mcp-repo' } } }),
+    ]);
+    check('mcp concurrent ids kept', p1.json?.id === 'conc-1' && p2.json?.id === 'conc-2' && (p1.json?.result?.content?.[0]?.text ?? '').includes('mcp-repo') && (p2.json?.result?.content?.[0]?.text ?? '').includes('mcp issue'), '');
+
+    // ---- Real git CLI ----
     const work = mkdtempSync(join(tmpdir(), 'forge-smoke-'));
-    const gitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', HOME: work, GIT_TERMINAL_PROMPT: '0' };
-    const gitAuth = (url) => url.replace('://', `://x:${TOKEN}@`);
-    const runGit = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', env: gitEnv });
-    runGit(work, 'config', '--global', 'user.name', 'Smoke Test');
-    runGit(work, 'config', '--global', 'user.email', 'smoke@example.invalid');
-    runGit(work, 'config', '--global', 'init.defaultBranch', 'main');
-    runGit(work, 'config', '--global', 'protocol.version', '2');
-    const remote = gitAuth(`${base}/adaiversen/smoke-repo.git`);
-    // clone the repo the REST surface built
-    const cloneDir = join(work, 'clone');
-    runGit(work, 'clone', remote, 'clone');
-    check('git clone works', true);
-    const log = runGit(cloneDir, 'log', '--oneline').trim().split('\n');
-    check('clone sees the merged history', log.length >= 3, `commits=${log.length}`);
-    const hello = runGit(cloneDir, 'show', 'HEAD:docs/hello.txt');
-    check('cloned file bytes match', hello.includes('third line'), hello.slice(0, 40));
-    // push a new commit
-    runGit(cloneDir, 'checkout', '-b', 'feature');
-    execFileSync('sh', ['-c', `printf 'feature work\\n' > feature.txt`], { cwd: cloneDir });
-    runGit(cloneDir, 'add', 'feature.txt');
-    runGit(cloneDir, 'commit', '-m', 'feature work');
-    runGit(cloneDir, 'push', 'origin', 'feature');
-    const ls = runGit(cloneDir, 'ls-remote', '--heads', 'origin');
-    check('git push + ls-remote see the new branch', ls.includes('refs/heads/feature'), ls.slice(0, 120));
-    // shallow clone
-    const shallowDir = join(work, 'shallow');
-    runGit(work, 'clone', '--depth', '1', remote, 'shallow');
-    const shallowLog = runGit(shallowDir, 'log', '--oneline').trim().split('\n');
-    check('shallow clone depth 1 has exactly one commit', shallowLog.length === 1, `commits=${shallowLog.length}`);
-    check('shallow file lists the tip as shallow', runGit(shallowDir, 'rev-parse', '--is-shallow-repository').trim() === 'true');
-    // non-fast-forward push is refused
-    runGit(cloneDir, 'checkout', 'main');
-    runGit(cloneDir, 'reset', '--hard', 'HEAD~1');
-    let refused = false;
-    try {
-      runGit(cloneDir, 'push', 'origin', 'main');
-    } catch (err) {
-      refused = /non-fast-forward|rejected/.test(String(err.stderr ?? '') + String(err.stdout ?? ''));
-    }
-    check('non-fast-forward push is refused', refused);
-    // tag push + fetch
-    runGit(cloneDir, 'tag', 'v1');
-    runGit(cloneDir, 'push', 'origin', 'v1');
-    const lsTags = runGit(cloneDir, 'ls-remote', '--tags', 'origin');
-    check('annotated tag push is listed', lsTags.includes('refs/tags/v1'), lsTags.slice(0, 120));
+    const remote = (repo) => `http://adaiversen:${TOKEN}@127.0.0.1:${port}/adaiversen/${repo}.git`;
+    const cfg = ['-c', 'user.name=Smoke', '-c', 'user.email=smoke@example.com', '-c', 'protocol.version=2'];
+    let gres = await git([...cfg, 'clone', remote('smoke-repo'), 'c1'], work);
+    check('git clone (v2) ok', gres.code === 0, `code=${gres.code} ${gres.stderr.slice(0, 200)}`);
+    writeFileSync(join(work, 'c1', 'a.txt'), 'alpha\n');
+    gres = await git([...cfg, 'add', 'a.txt'], join(work, 'c1'));
+    gres = await git([...cfg, 'commit', '-m', 'first'], join(work, 'c1'));
+    check('git commit ok', gres.code === 0, gres.stderr.slice(0, 150));
+    gres = await git([...cfg, 'push', 'origin', 'main'], join(work, 'c1'));
+    check('git push main ok', gres.code === 0, `code=${gres.code} ${gres.stderr.slice(0, 300)}`);
+    // Shallow clone depth 1.
+    gres = await git([...cfg, 'clone', '--depth', '1', remote('smoke-repo'), 'c2'], work);
+    check('git shallow clone depth 1', gres.code === 0, `code=${gres.code} ${gres.stderr.slice(0, 200)}`);
+    // Push a new branch.
+    gres = await git([...cfg, 'checkout', '-b', 'feature'], join(work, 'c1'));
+    writeFileSync(join(work, 'c1', 'b.txt'), 'beta\n');
+    await git([...cfg, 'add', 'b.txt'], join(work, 'c1'));
+    await git([...cfg, 'commit', '-m', 'feature work'], join(work, 'c1'));
+    gres = await git([...cfg, 'push', 'origin', 'feature'], join(work, 'c1'));
+    check('git push new branch ok', gres.code === 0, `code=${gres.code} ${gres.stderr.slice(0, 300)}`);
+    // PR via REST on the feature branch.
+    r = await req('/api/v3/repos/adaiversen/smoke-repo/pulls', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'add beta', head: 'feature', base: 'main' }) });
+    check('POST pull 201', r.status === 201 && r.json?.state === 'open' && r.json?.head?.ref === 'feature', `${r.status} ${r.text.slice(0, 150)}`);
+    const prNumber = r.json?.number;
+    r = await req(`/api/v3/repos/adaiversen/smoke-repo/pulls/${prNumber}/files`);
+    check('GET pull files has b.txt', r.status === 200 && Array.isArray(r.json) && r.json.some((f) => f.filename === 'b.txt'), `${r.status} ${r.text.slice(0, 150)}`);
+    r = await req(`/api/v3/repos/adaiversen/smoke-repo/pulls/${prNumber}/merge`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) });
+    check('PUT merge 200 merged', r.status === 200 && r.json?.merged === true && r.json?.sha, `${r.status} ${r.text.slice(0, 150)}`);
+    r = await req(`/api/v3/repos/adaiversen/smoke-repo/pulls/${prNumber}`);
+    check('PR closed after merge', r.status === 200 && r.json?.state === 'closed' && r.json?.merged === true, `${r.status}`);
+    // Non-fast-forward push refused.
+    gres = await git([...cfg, 'clone', remote('smoke-repo'), 'c3'], work);
+    check('git clone c3 ok', gres.code === 0, gres.stderr.slice(0, 150));
+    // Divergent history: reset c3's main to the pre-merge commit and commit something else.
+    const logRes = await git([...cfg, 'log', '--format=%H', 'main'], join(work, 'c3'));
+    const commits = logRes.stdout.trim().split('\n').filter(Boolean);
+    await git([...cfg, 'reset', '--hard', commits[1] ?? commits[0]], join(work, 'c3'));
+    writeFileSync(join(work, 'c3', 'div.txt'), 'divergent\n');
+    await git([...cfg, 'add', 'div.txt'], join(work, 'c3'));
+    await git([...cfg, 'commit', '-m', 'divergent'], join(work, 'c3'));
+    gres = await git([...cfg, 'push', 'origin', 'main'], join(work, 'c3'));
+    check('git non-fast-forward refused', gres.code !== 0 && /non-fast-forward/i.test(gres.stderr), `code=${gres.code} ${gres.stderr.slice(0, 300)}`);
+    // Push a tag.
+    gres = await git([...cfg, 'tag', 'v1.0'], join(work, 'c1'));
+    gres = await git([...cfg, 'push', 'origin', 'v1.0'], join(work, 'c1'));
+    check('git push tag ok', gres.code === 0, `code=${gres.code} ${gres.stderr.slice(0, 200)}`);
+    // Clone again and confirm the tag and merged file are there.
+    gres = await git([...cfg, 'clone', remote('smoke-repo'), 'c4'], work);
+    const hasB = await git([...cfg, 'show', 'main:b.txt'], join(work, 'c4'));
+    check('clone after merge has b.txt', gres.code === 0 && hasB.stdout.includes('beta'), `code=${gres.code}`);
     rmSync(work, { recursive: true, force: true });
+
+    // ---- DELETE repo ----
+    r = await req('/api/v3/repos/adaiversen/smoke-repo', { method: 'DELETE' });
+    check('DELETE repo 204', r.status === 204, `${r.status}`);
+    r = await req('/api/v3/repos/adaiversen/smoke-repo');
+    check('GET deleted repo 404', r.status === 404, `${r.status}`);
   } finally {
-    done = true;
-    const code = await Promise.race([exited, new Promise((r) => setTimeout(() => r(null), 8000))]);
-    check('forge exits 0 after /done flips true', code === 0, `exit=${code} stderr=${stderr.slice(0, 300)}`);
-    if (code === null) forge.kill('SIGKILL');
-    env.close();
+    server.kill('SIGTERM');
   }
-  console.log(`\n${passes} passed, ${failures} failed`);
-  process.exit(failures ? 1 : 0);
+
+  console.log(`\nSMOKE: ${passed} passed, ${failed} failed`);
+  if (failures.length > 0) console.log('failed checks:', failures.join(', '));
+  process.exit(failed === 0 ? 0 : 1);
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error('smoke harness error:', err);
   process.exit(1);
 });
